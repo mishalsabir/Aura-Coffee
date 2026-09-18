@@ -1,6 +1,7 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { Recipe, Category, CartItem, Order, OrderStatus, Customer } from '../types';
 import { INITIAL_RECIPES, INITIAL_CATEGORIES, INITIAL_ORDERS, INITIAL_CUSTOMERS } from '../data/initialData';
+import { supabase } from '../lib/supabase';
 
 interface StoreContextType {
   recipes: Recipe[];
@@ -9,6 +10,7 @@ interface StoreContextType {
   customers: Customer[];
   cart: CartItem[];
   favorites: string[];
+  isLoading: boolean;
   isCartOpen: boolean;
   isCheckoutOpen: boolean;
   isSearchOpen: boolean;
@@ -19,15 +21,15 @@ interface StoreContextType {
   toastMessage: string | null;
 
   // Recipe actions
-  addRecipe: (recipe: Omit<Recipe, 'id' | 'created_at' | 'updated_at'>) => Recipe;
-  updateRecipe: (id: string, updates: Partial<Recipe>) => void;
-  deleteRecipe: (id: string) => void;
-  toggleRecipeStatus: (id: string) => void;
+  addRecipe: (recipe: Omit<Recipe, 'id' | 'created_at' | 'updated_at'>) => Promise<Recipe>;
+  updateRecipe: (id: string, updates: Partial<Recipe>) => Promise<void>;
+  deleteRecipe: (id: string) => Promise<void>;
+  toggleRecipeStatus: (id: string) => Promise<void>;
 
   // Category actions
-  addCategory: (name: string) => Category;
-  updateCategory: (id: string, updates: Partial<Category>) => void;
-  deleteCategory: (id: string) => void;
+  addCategory: (name: string) => Promise<Category>;
+  updateCategory: (id: string, updates: Partial<Category>) => Promise<void>;
+  deleteCategory: (id: string) => Promise<void>;
 
   // Cart actions
   addToCart: (recipe: Recipe, quantity?: number) => void;
@@ -40,8 +42,8 @@ interface StoreContextType {
   cartTotal: number;
 
   // Order actions
-  createOrder: (customer: Order['customer']) => Order;
-  updateOrderStatus: (orderId: string, status: OrderStatus) => void;
+  createOrder: (customer: Order['customer']) => Promise<Order>;
+  updateOrderStatus: (orderId: string, status: OrderStatus) => Promise<void>;
 
   // UI state
   toggleFavorite: (recipeId: string) => void;
@@ -55,73 +57,96 @@ interface StoreContextType {
   setHasIntroPlayed: (played: boolean) => void;
   replayIntro: () => void;
   showToast: (msg: string) => void;
-  resetToDefaults: () => void;
+  resetToDefaults: () => Promise<void>;
 }
 
 const StoreContext = createContext<StoreContextType | undefined>(undefined);
 
-const STORAGE_KEYS = {
-  RECIPES: 'aura_coffee_recipes_v3_pkr',
-  CATEGORIES: 'aura_coffee_categories_v3_pkr',
-  ORDERS: 'aura_coffee_orders_v3_pkr',
-  CUSTOMERS: 'aura_coffee_customers_v3_pkr',
-  FAVORITES: 'aura_coffee_favorites_v3_pkr',
-  INTRO_PLAYED: 'aura_coffee_intro_played_v3',
+// Helpers to map between DB schema (snake_case) and Client types (camelCase)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mapDbRecipeToClient = (r: any): Recipe => ({
+  id: r.id,
+  name: r.name,
+  description: r.description || '',
+  price: Number(r.price),
+  category: r.category,
+  image: r.image,
+  status: r.status as 'active' | 'inactive',
+  rating: r.rating ? Number(r.rating) : 4.9,
+  isSignature: Boolean(r.is_signature),
+  isBestSeller: Boolean(r.is_best_seller),
+  calories: r.calories ? Number(r.calories) : undefined,
+  volume: r.volume || undefined,
+  created_at: r.created_at,
+  updated_at: r.updated_at,
+});
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mapClientRecipeToDb = (r: Partial<Recipe>): Record<string, any> => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const out: Record<string, any> = {};
+  if (r.id !== undefined) out.id = r.id;
+  if (r.name !== undefined) out.name = r.name;
+  if (r.description !== undefined) out.description = r.description;
+  if (r.price !== undefined) out.price = r.price;
+  if (r.category !== undefined) out.category = r.category;
+  if (r.image !== undefined) out.image = r.image;
+  if (r.status !== undefined) out.status = r.status;
+  if (r.rating !== undefined) out.rating = r.rating;
+  if (r.isSignature !== undefined) out.is_signature = r.isSignature;
+  if (r.isBestSeller !== undefined) out.is_best_seller = r.isBestSeller;
+  if (r.calories !== undefined) out.calories = r.calories;
+  if (r.volume !== undefined) out.volume = r.volume;
+  if (r.updated_at !== undefined) out.updated_at = r.updated_at;
+  return out;
 };
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mapDbCategoryToClient = (c: any): Category => ({
+  id: c.id,
+  name: c.name,
+  status: c.status as 'active' | 'inactive',
+  badgeColor: c.badge_color || undefined,
+});
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mapDbOrderToClient = (o: any): Order => ({
+  id: o.id,
+  customer: {
+    name: o.customer_name,
+    email: o.customer_email,
+    phone: o.customer_phone,
+    address: o.customer_address || undefined,
+    type: o.order_type as 'pickup' | 'delivery',
+  },
+  items: typeof o.items === 'string' ? JSON.parse(o.items) : o.items,
+  subtotal: Number(o.subtotal),
+  tax: Number(o.tax),
+  total: Number(o.total),
+  status: o.status as OrderStatus,
+  created_at: o.created_at,
+});
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mapDbCustomerToClient = (c: any): Customer => ({
+  id: c.id,
+  name: c.name,
+  email: c.email,
+  phone: c.phone,
+  totalOrders: Number(c.total_orders || 0),
+  totalSpent: Number(c.total_spent || 0),
+  lastOrderDate: c.last_order_date,
+});
+
 export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // Recipes state
-  const [recipes, setRecipes] = useState<Recipe[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.RECIPES);
-      return saved ? JSON.parse(saved) : INITIAL_RECIPES;
-    } catch {
-      return INITIAL_RECIPES;
-    }
-  });
-
-  // Categories state
-  const [categories, setCategories] = useState<Category[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.CATEGORIES);
-      return saved ? JSON.parse(saved) : INITIAL_CATEGORIES;
-    } catch {
-      return INITIAL_CATEGORIES;
-    }
-  });
-
-  // Orders state
-  const [orders, setOrders] = useState<Order[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.ORDERS);
-      return saved ? JSON.parse(saved) : INITIAL_ORDERS;
-    } catch {
-      return INITIAL_ORDERS;
-    }
-  });
-
-  // Customers state
-  const [customers, setCustomers] = useState<Customer[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.CUSTOMERS);
-      return saved ? JSON.parse(saved) : INITIAL_CUSTOMERS;
-    } catch {
-      return INITIAL_CUSTOMERS;
-    }
-  });
-
-  // Favorites state
-  const [favorites, setFavorites] = useState<string[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.FAVORITES);
-      return saved ? JSON.parse(saved) : ['rec-8', 'rec-2'];
-    } catch {
-      return ['rec-8', 'rec-2'];
-    }
-  });
-
-  // Cart state
+  // State initialized with fallback defaults, populated from Supabase
+  const [recipes, setRecipes] = useState<Recipe[]>(INITIAL_RECIPES);
+  const [categories, setCategories] = useState<Category[]>(INITIAL_CATEGORIES);
+  const [orders, setOrders] = useState<Order[]>(INITIAL_ORDERS);
+  const [customers, setCustomers] = useState<Customer[]>(INITIAL_CUSTOMERS);
+  const [favorites, setFavorites] = useState<string[]>(['rec-8', 'rec-2']);
   const [cart, setCart] = useState<CartItem[]>([]);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
 
   // UI state
   const [isCartOpen, setIsCartOpen] = useState(false);
@@ -132,11 +157,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [adminTab, setAdminTab] = useState('recipes');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Intro state: check session or localStorage
+  // Intro state: session-based
   const [hasIntroPlayed, setHasIntroPlayedState] = useState<boolean>(() => {
     try {
-      const sessionDismiss = sessionStorage.getItem(STORAGE_KEYS.INTRO_PLAYED);
-      return sessionDismiss === 'true';
+      return sessionStorage.getItem('aura_intro_played') === 'true';
     } catch {
       return false;
     }
@@ -145,177 +169,283 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const setHasIntroPlayed = (played: boolean) => {
     setHasIntroPlayedState(played);
     try {
-      sessionStorage.setItem(STORAGE_KEYS.INTRO_PLAYED, String(played));
-    } catch (e) {
-      console.warn(e);
-    }
-  };
-
-  const replayIntro = () => {
-    setHasIntroPlayedState(false);
-    sessionStorage.removeItem(STORAGE_KEYS.INTRO_PLAYED);
-  };
-
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => {
-      setToastMessage((prev) => (prev === msg ? null : prev));
-    }, 3200);
-  };
-
-  // Sync state to LocalStorage
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.RECIPES, JSON.stringify(recipes));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [recipes]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify(categories));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [categories]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(orders));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [orders]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.CUSTOMERS, JSON.stringify(customers));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [customers]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEYS.FAVORITES, JSON.stringify(favorites));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [favorites]);
-
-  // Broadcast channel for cross-tab sync
-  useEffect(() => {
-    let channel: BroadcastChannel | null = null;
-    try {
-      channel = new BroadcastChannel('aura_coffee_channel');
-      channel.onmessage = (event) => {
-        if (event.data?.type === 'SYNC') {
-          const rec = localStorage.getItem(STORAGE_KEYS.RECIPES);
-          if (rec) setRecipes(JSON.parse(rec));
-          const cat = localStorage.getItem(STORAGE_KEYS.CATEGORIES);
-          if (cat) setCategories(JSON.parse(cat));
-          const ord = localStorage.getItem(STORAGE_KEYS.ORDERS);
-          if (ord) setOrders(JSON.parse(ord));
-        }
-      };
-    } catch (e) {
-      console.warn('BroadcastChannel not supported', e);
-    }
-    return () => {
-      if (channel) channel.close();
-    };
-  }, []);
-
-  const notifySync = () => {
-    try {
-      const channel = new BroadcastChannel('aura_coffee_channel');
-      channel.postMessage({ type: 'SYNC' });
-      channel.close();
+      sessionStorage.setItem('aura_intro_played', String(played));
     } catch {
       // ignore
     }
   };
 
-  // RECIPE ACTIONS
-  const addRecipe = (recipeData: Omit<Recipe, 'id' | 'created_at' | 'updated_at'>) => {
+  const replayIntro = () => {
+    setHasIntroPlayedState(false);
+    try {
+      sessionStorage.removeItem('aura_intro_played');
+    } catch {
+      // ignore
+    }
+  };
+
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((prev) => (prev === msg ? null : prev));
+    }, 3200);
+  }, []);
+
+  // 1. Initial Data Fetch from Supabase Database
+  const fetchAllData = useCallback(async () => {
+    try {
+      setIsLoading(true);
+      const [recRes, catRes, ordRes, custRes] = await Promise.all([
+        supabase.from('recipes').select('*').order('created_at', { ascending: false }),
+        supabase.from('categories').select('*').order('created_at', { ascending: true }),
+        supabase.from('orders').select('*').order('created_at', { ascending: false }),
+        supabase.from('customers').select('*').order('last_order_date', { ascending: false }),
+      ]);
+
+      if (recRes.data && recRes.data.length > 0) {
+        setRecipes(recRes.data.map(mapDbRecipeToClient));
+      }
+      if (catRes.data && catRes.data.length > 0) {
+        setCategories(catRes.data.map(mapDbCategoryToClient));
+      }
+      if (ordRes.data && ordRes.data.length > 0) {
+        setOrders(ordRes.data.map(mapDbOrderToClient));
+      }
+      if (custRes.data && custRes.data.length > 0) {
+        setCustomers(custRes.data.map(mapDbCustomerToClient));
+      }
+    } catch (err) {
+      console.error('Error fetching Supabase data:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  // 2. Real-time Subscription via Supabase Channels
+  useEffect(() => {
+    fetchAllData();
+
+    // Listen to real-time changes across all 4 tables
+    const channel = supabase
+      .channel('aura-realtime-db-sync')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'recipes' },
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            const newItem = mapDbRecipeToClient(payload.new);
+            setRecipes((prev) => [newItem, ...prev.filter((r) => r.id !== newItem.id)]);
+          } else if (payload.eventType === 'UPDATE') {
+            const updatedItem = mapDbRecipeToClient(payload.new);
+            setRecipes((prev) =>
+              prev.map((r) => (r.id === updatedItem.id ? updatedItem : r))
+            );
+          } else if (payload.eventType === 'DELETE') {
+            const deletedId = (payload.old as { id: string }).id;
+            setRecipes((prev) => prev.filter((r) => r.id !== deletedId));
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'categories' },
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            const newItem = mapDbCategoryToClient(payload.new);
+            setCategories((prev) => [...prev.filter((c) => c.id !== newItem.id), newItem]);
+          } else if (payload.eventType === 'UPDATE') {
+            const updatedItem = mapDbCategoryToClient(payload.new);
+            setCategories((prev) =>
+              prev.map((c) => (c.id === updatedItem.id ? updatedItem : c))
+            );
+          } else if (payload.eventType === 'DELETE') {
+            const deletedId = (payload.old as { id: string }).id;
+            setCategories((prev) => prev.filter((c) => c.id !== deletedId));
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'orders' },
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            const newItem = mapDbOrderToClient(payload.new);
+            setOrders((prev) => [newItem, ...prev.filter((o) => o.id !== newItem.id)]);
+          } else if (payload.eventType === 'UPDATE') {
+            const updatedItem = mapDbOrderToClient(payload.new);
+            setOrders((prev) =>
+              prev.map((o) => (o.id === updatedItem.id ? updatedItem : o))
+            );
+          } else if (payload.eventType === 'DELETE') {
+            const deletedId = (payload.old as { id: string }).id;
+            setOrders((prev) => prev.filter((o) => o.id !== deletedId));
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'customers' },
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            const newItem = mapDbCustomerToClient(payload.new);
+            setCustomers((prev) => [newItem, ...prev.filter((c) => c.id !== newItem.id)]);
+          } else if (payload.eventType === 'UPDATE') {
+            const updatedItem = mapDbCustomerToClient(payload.new);
+            setCustomers((prev) =>
+              prev.map((c) => (c.id === updatedItem.id ? updatedItem : c))
+            );
+          } else if (payload.eventType === 'DELETE') {
+            const deletedId = (payload.old as { id: string }).id;
+            setCustomers((prev) => prev.filter((c) => c.id !== deletedId));
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchAllData]);
+
+  // 3. RECIPE DATABASE ACTIONS
+  const addRecipe = async (
+    recipeData: Omit<Recipe, 'id' | 'created_at' | 'updated_at'>
+  ): Promise<Recipe> => {
     const newRecipe: Recipe = {
       ...recipeData,
       id: `rec-${Date.now()}`,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
+
+    // Optimistic UI update
     setRecipes((prev) => [newRecipe, ...prev]);
-    showToast(`"${newRecipe.name}" added to menu`);
-    notifySync();
+    showToast(`"${newRecipe.name}" added to Supabase database`);
+
+    // Supabase DB insert
+    const dbPayload = mapClientRecipeToDb(newRecipe);
+    const { error } = await supabase.from('recipes').insert([dbPayload]);
+    if (error) {
+      console.error('Failed to insert recipe into Supabase:', error);
+      showToast(`Error saving to database: ${error.message}`);
+    }
+
     return newRecipe;
   };
 
-  const updateRecipe = (id: string, updates: Partial<Recipe>) => {
+  const updateRecipe = async (id: string, updates: Partial<Recipe>): Promise<void> => {
+    const timestamp = new Date().toISOString();
+    // Optimistic update
     setRecipes((prev) =>
-      prev.map((r) => {
-        if (r.id === id) {
-          const updated = { ...r, ...updates, updated_at: new Date().toISOString() };
-          return updated;
-        }
-        return r;
-      })
+      prev.map((r) => (r.id === id ? { ...r, ...updates, updated_at: timestamp } : r))
     );
-    showToast('Recipe updated successfully');
-    notifySync();
+    showToast('Recipe updated in Supabase');
+
+    const dbPayload = mapClientRecipeToDb({ ...updates, updated_at: timestamp });
+    const { error } = await supabase.from('recipes').update(dbPayload).eq('id', id);
+    if (error) {
+      console.error('Failed to update recipe in Supabase:', error);
+      showToast(`Error updating database: ${error.message}`);
+    }
   };
 
-  const deleteRecipe = (id: string) => {
+  const deleteRecipe = async (id: string): Promise<void> => {
     const target = recipes.find((r) => r.id === id);
+    // Optimistic update
     setRecipes((prev) => prev.filter((r) => r.id !== id));
-    if (target) showToast(`"${target.name}" removed from menu`);
-    notifySync();
+    if (target) showToast(`"${target.name}" removed from database`);
+
+    const { error } = await supabase.from('recipes').delete().eq('id', id);
+    if (error) {
+      console.error('Failed to delete recipe from Supabase:', error);
+      showToast(`Error deleting from database: ${error.message}`);
+    }
   };
 
-  const toggleRecipeStatus = (id: string) => {
+  const toggleRecipeStatus = async (id: string): Promise<void> => {
+    const target = recipes.find((r) => r.id === id);
+    if (!target) return;
+    const newStatus = target.status === 'active' ? 'inactive' : 'active';
+    const timestamp = new Date().toISOString();
+
     setRecipes((prev) =>
-      prev.map((r) => {
-        if (r.id === id) {
-          const newStatus = r.status === 'active' ? 'inactive' : 'active';
-          showToast(`"${r.name}" is now ${newStatus === 'active' ? 'visible on website' : 'hidden from website'}`);
-          return { ...r, status: newStatus, updated_at: new Date().toISOString() };
-        }
-        return r;
-      })
+      prev.map((r) =>
+        r.id === id ? { ...r, status: newStatus, updated_at: timestamp } : r
+      )
     );
-    notifySync();
+    showToast(
+      `"${target.name}" is now ${newStatus === 'active' ? 'visible on website' : 'hidden from website'}`
+    );
+
+    const { error } = await supabase
+      .from('recipes')
+      .update({ status: newStatus, updated_at: timestamp })
+      .eq('id', id);
+
+    if (error) {
+      console.error('Failed to toggle status in Supabase:', error);
+    }
   };
 
-  // CATEGORY ACTIONS
-  const addCategory = (name: string) => {
+  // 4. CATEGORY DATABASE ACTIONS
+  const addCategory = async (name: string): Promise<Category> => {
     const newCategory: Category = {
       id: `cat-${Date.now()}`,
       name,
       status: 'active',
       badgeColor: 'bg-[#4a2e1b] text-[#edd5be] border border-[#6b452b]',
     };
+
     setCategories((prev) => [...prev, newCategory]);
-    showToast(`Category "${name}" created`);
-    notifySync();
+    showToast(`Category "${name}" created in database`);
+
+    const { error } = await supabase.from('categories').insert([
+      {
+        id: newCategory.id,
+        name: newCategory.name,
+        status: newCategory.status,
+        badge_color: newCategory.badgeColor,
+      },
+    ]);
+
+    if (error) {
+      console.error('Failed to insert category into Supabase:', error);
+      showToast(`Error saving category: ${error.message}`);
+    }
+
     return newCategory;
   };
 
-  const updateCategory = (id: string, updates: Partial<Category>) => {
+  const updateCategory = async (id: string, updates: Partial<Category>): Promise<void> => {
     setCategories((prev) =>
       prev.map((c) => (c.id === id ? { ...c, ...updates } : c))
     );
-    showToast('Category updated');
-    notifySync();
+    showToast('Category updated in Supabase');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dbPayload: Record<string, any> = {};
+    if (updates.name !== undefined) dbPayload.name = updates.name;
+    if (updates.status !== undefined) dbPayload.status = updates.status;
+    if (updates.badgeColor !== undefined) dbPayload.badge_color = updates.badgeColor;
+
+    const { error } = await supabase.from('categories').update(dbPayload).eq('id', id);
+    if (error) {
+      console.error('Failed to update category in Supabase:', error);
+    }
   };
 
-  const deleteCategory = (id: string) => {
+  const deleteCategory = async (id: string): Promise<void> => {
     const target = categories.find((c) => c.id === id);
     setCategories((prev) => prev.filter((c) => c.id !== id));
     if (target) showToast(`Category "${target.name}" deleted`);
-    notifySync();
+
+    const { error } = await supabase.from('categories').delete().eq('id', id);
+    if (error) {
+      console.error('Failed to delete category in Supabase:', error);
+    }
   };
 
-  // CART ACTIONS
+  // 5. CART ACTIONS (Client Session)
   const addToCart = (recipe: Recipe, quantity: number = 1) => {
     setCart((prev) => {
       const existing = prev.find((item) => item.recipe.id === recipe.id);
@@ -357,8 +487,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const cartTax = Math.round(cartSubtotal * 0.08);
   const cartTotal = cartSubtotal + cartTax;
 
-  // ORDER ACTIONS
-  const createOrder = (customerData: Order['customer']) => {
+  // 6. ORDER DATABASE ACTIONS
+  const createOrder = async (customerData: Order['customer']): Promise<Order> => {
     const newOrder: Order = {
       id: `ORD-${Math.floor(1000 + Math.random() * 9000)}`,
       customer: customerData,
@@ -376,24 +506,44 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       created_at: new Date().toISOString(),
     };
 
+    // Optimistic UI update
     setOrders((prev) => [newOrder, ...prev]);
 
-    // Update or add customer record
-    setCustomers((prev) => {
-      const existing = prev.find((c) => c.email.toLowerCase() === customerData.email.toLowerCase());
-      if (existing) {
-        return prev.map((c) =>
-          c.id === existing.id
-            ? {
-                ...c,
-                totalOrders: c.totalOrders + 1,
-                totalSpent: +(c.totalSpent + newOrder.total).toFixed(2),
-                lastOrderDate: newOrder.created_at,
-              }
-            : c
-        );
-      } else {
-        const newCust: Customer = {
+    // Insert order into Supabase
+    const { error: orderErr } = await supabase.from('orders').insert([
+      {
+        id: newOrder.id,
+        customer_name: customerData.name,
+        customer_email: customerData.email,
+        customer_phone: customerData.phone,
+        customer_address: customerData.address || null,
+        order_type: customerData.type,
+        items: newOrder.items,
+        subtotal: newOrder.subtotal,
+        tax: newOrder.tax,
+        total: newOrder.total,
+        status: newOrder.status,
+        created_at: newOrder.created_at,
+      },
+    ]);
+
+    if (orderErr) {
+      console.error('Failed to save order in Supabase:', orderErr);
+    }
+
+    // Upsert Customer in Supabase
+    const existingCust = customers.find(
+      (c) => c.email.toLowerCase() === customerData.email.toLowerCase()
+    );
+
+    const updatedCustomer: Customer = existingCust
+      ? {
+          ...existingCust,
+          totalOrders: existingCust.totalOrders + 1,
+          totalSpent: +(existingCust.totalSpent + newOrder.total).toFixed(2),
+          lastOrderDate: newOrder.created_at,
+        }
+      : {
           id: `cust-${Date.now()}`,
           name: customerData.name,
           email: customerData.email,
@@ -402,48 +552,81 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           totalSpent: newOrder.total,
           lastOrderDate: newOrder.created_at,
         };
-        return [newCust, ...prev];
-      }
-    });
+
+    setCustomers((prev) => [
+      updatedCustomer,
+      ...prev.filter((c) => c.email.toLowerCase() !== customerData.email.toLowerCase()),
+    ]);
+
+    await supabase.from('customers').upsert([
+      {
+        id: updatedCustomer.id,
+        name: updatedCustomer.name,
+        email: updatedCustomer.email,
+        phone: updatedCustomer.phone,
+        total_orders: updatedCustomer.totalOrders,
+        total_spent: updatedCustomer.totalSpent,
+        last_order_date: updatedCustomer.lastOrderDate,
+      },
+    ]);
 
     clearCart();
-    notifySync();
+    showToast(`Order #${newOrder.id} placed successfully!`);
     return newOrder;
   };
 
-  const updateOrderStatus = (orderId: string, status: OrderStatus) => {
+  const updateOrderStatus = async (orderId: string, status: OrderStatus): Promise<void> => {
     setOrders((prev) =>
       prev.map((o) => (o.id === orderId ? { ...o, status } : o))
     );
-    showToast(`Order #${orderId} updated to "${status}"`);
-    notifySync();
+    showToast(`Order #${orderId} updated to "${status}" in Supabase`);
+
+    const { error } = await supabase
+      .from('orders')
+      .update({ status })
+      .eq('id', orderId);
+
+    if (error) {
+      console.error('Failed to update order status in Supabase:', error);
+    }
   };
 
-  // FAVORITES
+  // 7. FAVORITES
   const toggleFavorite = (recipeId: string) => {
-    setFavorites((prev) => {
-      if (prev.includes(recipeId)) {
-        return prev.filter((id) => id !== recipeId);
-      } else {
-        return [...prev, recipeId];
-      }
-    });
+    setFavorites((prev) =>
+      prev.includes(recipeId) ? prev.filter((id) => id !== recipeId) : [...prev, recipeId]
+    );
   };
 
   const isFavorite = (recipeId: string) => favorites.includes(recipeId);
 
-  // RESET UTILITY
-  const resetToDefaults = () => {
-    setRecipes(INITIAL_RECIPES);
-    setCategories(INITIAL_CATEGORIES);
-    setOrders(INITIAL_ORDERS);
-    setCustomers(INITIAL_CUSTOMERS);
-    localStorage.removeItem(STORAGE_KEYS.RECIPES);
-    localStorage.removeItem(STORAGE_KEYS.CATEGORIES);
-    localStorage.removeItem(STORAGE_KEYS.ORDERS);
-    localStorage.removeItem(STORAGE_KEYS.CUSTOMERS);
-    showToast('Reset data to default luxury coffee menu');
-    notifySync();
+  // 8. RESET UTILITY (Reseeds Supabase)
+  const resetToDefaults = async (): Promise<void> => {
+    setIsLoading(true);
+    showToast('Resetting Supabase database to default menu...');
+
+    try {
+      // Re-seed Supabase database
+      for (const r of INITIAL_RECIPES) {
+        await supabase.from('recipes').upsert([mapClientRecipeToDb(r)]);
+      }
+      for (const c of INITIAL_CATEGORIES) {
+        await supabase.from('categories').upsert([
+          {
+            id: c.id,
+            name: c.name,
+            status: c.status,
+            badge_color: c.badgeColor,
+          },
+        ]);
+      }
+      await fetchAllData();
+      showToast('Database reset to master luxury coffee menu!');
+    } catch (err) {
+      console.error('Error resetting to defaults:', err);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
@@ -455,6 +638,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         customers,
         cart,
         favorites,
+        isLoading,
         isCartOpen,
         isCheckoutOpen,
         isSearchOpen,
@@ -506,4 +690,3 @@ export const useStore = () => {
   }
   return context;
 };
-

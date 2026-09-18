@@ -22,7 +22,7 @@ export const CheckoutModal: React.FC = () => {
 
   if (!isCheckoutOpen) return null;
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.name || !formData.email || !formData.phone) {
       alert('Please provide your name, email, and phone number.');
@@ -31,8 +31,8 @@ export const CheckoutModal: React.FC = () => {
 
     setIsSubmitting(true);
 
-    setTimeout(() => {
-      const order = createOrder({
+    try {
+      const order = await createOrder({
         name: formData.name,
         email: formData.email,
         phone: formData.phone,
@@ -54,7 +54,10 @@ export const CheckoutModal: React.FC = () => {
 
       setIsSubmitting(false);
       setCompletedOrder(order);
-    }, 600);
+    } catch (err) {
+      console.error(err);
+      setIsSubmitting(false);
+    }
   };
 
   const handleClose = () => {
